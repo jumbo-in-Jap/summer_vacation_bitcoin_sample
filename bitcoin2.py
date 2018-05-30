@@ -9,10 +9,19 @@ from keras.models import Sequential
 from keras.layers.core import Dense, Activation
 from keras.layers.recurrent import LSTM
 
+class PredictResult :    
+    def __init__(self, accurancy: float, benefit: int):
+        self.accurancy = accurancy
+        self.benefit   = benefit
+
+
 class Prediction :
 
     def __init__(self):
+        self.pre_dataset = None
         self.dataset = None
+        self.normalize_val = None
+
         # 算出する値たち
         self.model = None
         self.train_predict = None
@@ -23,18 +32,22 @@ class Prediction :
         self.steps_in_future = 1
         self.csv_path = './csv/bitcoin_log.csv'
 
+        # 結果
+        self.result = None
+
     def load_dataset(self):
         # データ準備
         dataframe = pd.read_csv(self.csv_path,
                 usecols=['終値'],
-                engine='python').sort_values('終値', ascending=True)
-        self.dataset = dataframe.values
+                engine='python')
+        self.dataset = dataframe.values[::-1]
         self.dataset = self.dataset.astype('float32')
 
         # 標準化
+        self.pre_dataset = dataframe.values[::-1]
+        self.normalize_val = np.max(np.abs(self.dataset))
         self.dataset -= np.min(np.abs(self.dataset))
         self.dataset /= np.max(np.abs(self.dataset))
-
 
     def create_dataset(self):
         X, Y = [], []
@@ -53,44 +66,35 @@ class Prediction :
         # Build neural network
         net = tflearn.input_data(shape=[None, self.steps_of_history, 1])
 
-        # LSTMは時間かかるのでGRU
-        # http://dhero.hatenablog.com/entry/2016/12/02/%E6%9C%80%E5%BC%B1SE%E3%81%A7%E3%82%82%E6%A9%9F%E6%A2%B0%E5%AD%A6%E7%BF%92%E3%81%A7%E3%81%8A%E9%87%91%E3%81%8C%E7%A8%BC%E3%81%8E%E3%81%9F%E3%81%84%E3%80%905%E6%97%A5%E7%9B%AE%E3%83%BBTFLearn%E3%81%A8
         net = tflearn.gru(net, n_units=6)
         net = tflearn.fully_connected(net, 1, activation='linear')
-
-        # 回帰の設定
-        # Adam法で測定
-        # http://qiita.com/TomokIshii/items/f355d8e87d23ee8e0c7a
-        # 時系列分析での予測精度の指標にmean_squareを使っている
-        # mapeが一般的なようだ
-        # categorical_crossentropy
-        # mean_square : 二乗平均平方根
-        net = tflearn.regression(net, optimizer='adam', learning_rate=0.001,
+        net = tflearn.regression(net, optimizer='adam', learning_rate=0.01,
                 loss='mean_square')
 
         # Define model
-        self.model = tflearn.DNN(net, tensorboard_verbose=0)
+        self.model = tflearn.DNN(net, tensorboard_verbose=1)
 
-        # 今回は80%を訓練データセット、20%をテストデータセットとして扱う。
         pos = round(len(X) * (1 - 0.2))
-        # trainX = 0.8, trainY = 0.2, testX = 0.8, testY = 0.2
+        # 8割を訓練データ
         trainX, trainY = X[:pos], Y[:pos]
+        # 2割をテストデータにする
         testX, testY   = X[pos:], Y[pos:]
         
         return trainX, trainY, testX, testY
 
-    def executePredict(self, trainX, trainY, testX, testY):
+    def execute_predict(self, trainX, trainY, testX, testY):
         # Start training (apply gradient descent algorithm)
         # 正規化した訓練、テストデータをそれぞれ入れてfittingする
-        self.model.fit(trainX, trainY, validation_set=0.1, show_metric=True, batch_size=1, n_epoch=50, run_id='btc')
+        self.model.fit(trainX, trainY, validation_set=0.1, show_metric=True, batch_size=32, n_epoch=150, run_id='btc')
 
         # predict
-        self.train_predict = self.model.predict(trainX)
-        self.test_predict = self.model.predict(testX)
-
+        # 訓練データに基づく再予測
+        self.train_predict = self.model.predict(trainX) * self.normalize_val
+        # テストデータに基づく実予測
+        self.test_predict = self.model.predict(testX) * self.normalize_val
         print('Accuracy: {0:.3f}'.format(self.model.evaluate(testX, testY)[0]))
 
-    def showResult(self):
+    def plot_graph(self):
         # plot train data
         train_predict_plot = np.empty_like(self.dataset)
         train_predict_plot[:, :] = np.nan
@@ -106,18 +110,47 @@ class Prediction :
         # plot show res
         plt.figure(figsize=(8, 8))
         plt.title('History={} Future={}'.format(self.steps_of_history, self.steps_in_future))
-        plt.plot(self.dataset, label="actual", color="k")
+        plt.plot(self.pre_dataset, label="actual", color="k")
         plt.plot(train_predict_plot, label="train", color="r")
         plt.plot(test_predict_plot, label="test", color="b")
+        # 凡例を表示
+        plt.legend()
         plt.savefig('result.png')
-        plt.show()
+    
+    def calc_result(self):
+        # 最後の30日で計算する
+        span_date = 30
+        # 1日後の価格と比較する
+        time_span = 1
+        predict_last = self.test_predict[-30:]
+        actual_last = self.pre_dataset[-30:]
+        total_benefit = 0
+        
+        for i in range(len(predict_last)):
+            predict_price = predict_last[i][0]
+            actual_price = actual_last[i][0]
 
+            compare_predict_index = i + time_span
+            if compare_predict_index < len(predict_last):
+                compare_predict_price = predict_last[compare_predict_index][0]
+                is_up = compare_predict_price - predict_price > 0
+                if is_up:
+                    margin_price = actual_last[compare_predict_index][0] - actual_last[i][0]
+                    total_benefit += margin_price
+                    print("上がるので買います、翌日に売ると利益は%d円です" % margin_price)
+
+        print("結果として %d円儲かりました" % total_benefit)
+
+    def execute(self):
+        trainX, trainY, testX, testY = self.setup()
+        self.execute_predict(trainX, trainY, testX, testY)
+        self.plot_graph()
+        self.calc_result()
+        
 
 if __name__ == "__main__":
 
     prediction = Prediction()
-    trainX, trainY, testX, testY = prediction.setup()
-    prediction.executePredict(trainX, trainY, testX, testY)
-    prediction.showResult()
+    prediction.execute()
 
 
